@@ -1,0 +1,81 @@
+name: oci-snatch
+
+# 每 5 分钟试一次（GitHub 实际调度常有几分钟延迟，属正常）。
+# 也可以在 Actions 页面手动 Run workflow 立刻试一次。
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+# 抢到后要能自己关掉自己（disable workflow）并开一个 Issue 通知仓库主人。
+permissions:
+  actions: write
+  issues: write
+  contents: read
+
+# 同一时间只跑一个，排队的自动作废，避免重叠。
+concurrency:
+  group: oci-snatch
+  cancel-in-progress: false
+
+jobs:
+  snatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install OCI SDK
+        run: pip install --quiet oci
+
+      - name: Write OCI config from secrets
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s' "$OCI_CONFIG" > ~/.oci/config
+          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/config ~/.oci/oci_api_key.pem
+          # 不管原 config 里 key_file 写的是什么路径，统一改成本机的
+          sed -i "s|^key_file=.*|key_file=$HOME/.oci/oci_api_key.pem|" ~/.oci/config
+
+      - name: Try one launch attempt
+        id: attempt
+        env:
+          OCI_OCPUS: ${{ vars.OCI_OCPUS }}
+          OCI_MEMORY_GB: ${{ vars.OCI_MEMORY_GB }}
+        run: |
+          set +e
+          python snatch_once.py 2>&1 | tee result.log
+          code=${PIPESTATUS[0]}
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if grep -q "SNATCH_RESULT=SUCCESS" result.log; then
+            echo "success=true" >> "$GITHUB_OUTPUT"
+            ip=$(grep "SNATCH_RESULT=SUCCESS" result.log | sed 's/.*ip=//')
+            echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Notify and stop on success
+        if: steps.attempt.outputs.success == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOT_IP: ${{ steps.attempt.outputs.ip }}
+        run: |
+          gh issue create \
+            --title "🎉 甲骨文免费实例抢到了" \
+            --body "GitHub 抢机已成功创建 VM.Standard.A1.Flex 实例（a1-nextcloud）。公网 IP：**${GOT_IP}**。把这个 IP 发给 Muse，他会接着部署 Nextcloud 私人云盘。本工作流已自动停用，不会再重复运行。"
+          gh workflow disable snatch.yml
+
+      - name: Fail the run only on real errors
+        if: steps.attempt.outputs.success != 'true' && steps.attempt.outputs.exit_code != '10' && steps.attempt.outputs.exit_code != '0'
+        run: |
+          echo "脚本以错误码 ${{ steps.attempt.outputs.exit_code }} 退出，请看上面日志（多半是 Secrets 里的配置或私钥不对）。"
+          exit 1
